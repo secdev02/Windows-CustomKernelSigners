@@ -6,31 +6,36 @@
     Creates a Hyper-V Gen 2 test VM for Custom Kernel Signers (CKS) development.
 
 .DESCRIPTION
+    Part of the CKS Hyper-V toolkit in tools\hyper-v\. Run from the repo root
+    or from tools\hyper-v\ -- the script has no repo-relative dependencies itself.
+
     Creates a Generation 2 VM configured for CKS testing:
 
-      - SecureBoot OFF, no template enrolled
-        A fresh Gen 2 VM with SecureBoot disabled and no SecureBootTemplate
-        has no UEFI keys pre-populated. This leaves the virtual UEFI in
-        Setup Mode, which is required so that 03-Set-UEFI-Keys.ps1 can enroll
-        a custom PK without needing a signed authenticated variable update.
+      SecureBoot OFF, no template
+        A fresh Gen 2 VM with SecureBoot disabled and no SecureBootTemplate has
+        no UEFI keys pre-populated. This leaves the virtual UEFI in Setup Mode,
+        which is required so that 03-Set-UEFI-Keys.ps1 can enroll a custom
+        Platform Key without needing a signed authenticated variable update.
 
-      - Nested virtualisation DISABLED
+      Nested virtualisation DISABLED
         Exposing virtualisation extensions to the guest enables VBS/HVCI inside
-        the VM. ckspdrv.sys is not HVCI-compatible, so nested virt must be off.
+        the VM. ckspdrv.sys is not HVCI-compatible, so this must remain off.
 
-      - Fixed memory, no dynamic memory
-        Kernel development benefits from a stable memory layout.
+      Fixed memory, checkpoints disabled
+        Kernel development benefits from a stable memory layout and clean state.
 
-    After running this script the expected workflow is:
-      1. Install Windows 11 Enterprise or Education inside the VM.
-         (ConvertFrom-CIPolicy is not available on Home or Pro.)
-      2. Run 02-New-CKS-PKI.ps1 on the HOST to generate the certificate chain.
-      3. Copy the PKI folder into the VM (via Enhanced Session clipboard share).
-      4. Run 03-Set-UEFI-Keys.ps1 INSIDE the VM.
-      5. On the HOST: Set-VMFirmware -VMName <name> -EnableSecureBoot On
-      6. Reboot the VM -- SecureBoot now enforces your custom PK.
-      7. Run 04-Deploy-SiPolicy.ps1 INSIDE the VM.
-      8. Run 05-Install-CKS-Driver.ps1 INSIDE the VM.
+    Expected workflow after this script:
+      1.  Start-VM and install Windows 11 Enterprise or Education.
+          (ConvertFrom-CIPolicy is not available on Home or Pro.)
+      2.  HOST:  .\02-New-CKS-PKI.ps1
+      3.          Copy tools\hyper-v\pki\ into the VM.
+      4.  GUEST: .\03-Set-UEFI-Keys.ps1
+                  Shut down the VM.
+      5.  HOST:  Set-VMFirmware -VMName <name> -EnableSecureBoot On
+                  Start-VM -Name <name>
+      6.  GUEST: .\04-Deploy-SiPolicy.ps1
+                  Reboot when prompted.
+      7.  GUEST: .\05-Install-CKS-Driver.ps1  (within ~10 min of reboot)
 
 .PARAMETER VMName
     Name for the new virtual machine. Default: CKS-TestVM
@@ -82,7 +87,7 @@ function Write-Note { param([string]$Msg) Write-Host "[!] $Msg" -ForegroundColor
 # ---------------------------------------------------------------------------
 if (-not (Get-Module -ListAvailable -Name Hyper-V)) {
     throw "Hyper-V PowerShell module not found.`n" +
-          "Enable Hyper-V: Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All"
+          "Enable it: Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All"
 }
 
 # ---------------------------------------------------------------------------
@@ -117,37 +122,41 @@ Write-OK "VM created (Generation 2 / UEFI)"
 
 Set-VM -Name $VMName `
     -ProcessorCount              $CPUCount `
-    -DynamicMemory               $false `
     -AutomaticCheckpointsEnabled $false `
     -CheckpointType              Disabled
 
-Write-OK "CPU and memory configured"
+# -DynamicMemory is a switch parameter on Set-VM -- passing $false to a switch
+# causes "positional parameter not found". Set-VMMemory has a proper bool parameter.
+Set-VMMemory -VMName $VMName -DynamicMemoryEnabled $false
+
+Write-OK "CPU ($CPUCount vCPU) and memory ($MemoryGB GB fixed) configured"
 
 # ---------------------------------------------------------------------------
-# Disable nested virtualisation -- prevents VBS/HVCI inside the guest
-# ckspdrv.sys is not HVCI-compatible. If the guest activates VBS it will
-# enforce its own signing requirements that CKS does not satisfy.
+# Disable nested virtualisation
+# Prevents VBS/HVCI from activating inside the guest. ckspdrv.sys is not
+# HVCI-compatible -- if the guest activates HVCI it will block the driver
+# regardless of CKS being enabled.
 # ---------------------------------------------------------------------------
-Set-VMProcessor -VMName $VMName -ExposeVirtualizationExtensions $false
+Set-VMProcessor -VMName $VMName -ExposeVirtualizationExtensions:$false
 Write-OK "Nested virtualisation disabled (VBS/HVCI will not activate in guest)"
 
 # ---------------------------------------------------------------------------
 # SecureBoot OFF, no template
 #
-# CRITICAL: New-VM Gen 2 defaults to SecureBoot On + MicrosoftWindows template.
-# Setting -EnableSecureBoot Off before the VM is started prevents any keys from
-# being written to the virtual UEFI NVRAM. The result is a clean UEFI with no
-# PK, KEK, or db -- i.e., Setup Mode.
+# New-VM -Generation 2 defaults to SecureBoot On with the MicrosoftWindows
+# template. Setting -EnableSecureBoot Off before the VM is ever started
+# prevents any keys from being written to the virtual UEFI NVRAM, leaving
+# the UEFI in Setup Mode -- required for 03-Set-UEFI-Keys.ps1.
 #
-# If you accidentally start the VM before running 03-Set-UEFI-Keys.ps1, the
-# UEFI will have been initialised with Microsoft's keys and you will need to
-# boot a UEFI shell to clear them manually before key enrollment will work.
+# If the VM is started before running 03-Set-UEFI-Keys.ps1, the UEFI will
+# have been initialised and may have keys enrolled. In that case, boot a
+# UEFI Shell ISO to clear the keys before re-running the enrollment script.
 # ---------------------------------------------------------------------------
 Set-VMFirmware -VMName $VMName -EnableSecureBoot Off
 Write-OK "SecureBoot disabled (no template = UEFI Setup Mode for custom PK enrollment)"
 
 # ---------------------------------------------------------------------------
-# Attach Windows 11 ISO and set boot order: DVD first
+# Attach ISO and set boot order
 # ---------------------------------------------------------------------------
 $dvd = Add-VMDvdDrive -VMName $VMName -Path $ISOPath -Passthru
 $hdd = Get-VMHardDiskDrive -VMName $VMName
@@ -156,11 +165,11 @@ Set-VMFirmware -VMName $VMName -BootOrder $dvd, $hdd
 Write-OK "ISO attached, boot order: DVD -> VHDX"
 
 # ---------------------------------------------------------------------------
-# Enable Enhanced Session for clipboard/drive sharing between host and guest
+# Enhanced Session for clipboard / drive sharing between host and guest
 # ---------------------------------------------------------------------------
 Set-VMHost -EnableEnhancedSessionMode $true -ErrorAction SilentlyContinue
 Set-VM    -VMName $VMName -EnhancedSessionTransportType HvSocket -ErrorAction SilentlyContinue
-Write-OK "Enhanced Session Mode enabled (clipboard sharing for file transfer)"
+Write-OK "Enhanced Session Mode enabled"
 
 # ---------------------------------------------------------------------------
 # Done
@@ -168,26 +177,21 @@ Write-OK "Enhanced Session Mode enabled (clipboard sharing for file transfer)"
 Write-Host ""
 Write-OK "VM '$VMName' is ready."
 Write-Host ""
-Write-Note "NEXT STEPS -- follow this order exactly:"
+Write-Note "NEXT STEPS -- follow this order:"
 Write-Host ""
 Write-Host "  [HOST]  Start-VM -Name '$VMName'"
-Write-Host "          Install Windows 11 ENTERPRISE or EDUCATION"
-Write-Host "          (ConvertFrom-CIPolicy is not on Home/Pro)"
+Write-Host "          Install Windows 11 Enterprise or Education"
 Write-Host ""
-Write-Host "  [HOST]  .\02-New-CKS-PKI.ps1 -OutputPath C:\CKS-PKI"
+Write-Host "  [HOST]  .\02-New-CKS-PKI.ps1"
+Write-Host "          Copy the generated tools\hyper-v\pki\ folder into the VM"
 Write-Host ""
-Write-Host "  [HOST]  Copy C:\CKS-PKI into the VM"
-Write-Host "          (Enhanced Session shares clipboard; use a VHD or shared folder if preferred)"
-Write-Host ""
-Write-Host "  [GUEST] .\03-Set-UEFI-Keys.ps1 -PKIPath C:\CKS-PKI"
-Write-Host "          Then SHUT DOWN the VM (do not reboot -- shut down)"
+Write-Host "  [GUEST] .\03-Set-UEFI-Keys.ps1"
+Write-Host "          Then SHUT DOWN the VM (not restart)"
 Write-Host ""
 Write-Host "  [HOST]  Set-VMFirmware -VMName '$VMName' -EnableSecureBoot On"
 Write-Host "          Start-VM -Name '$VMName'"
-Write-Host "          Windows should boot normally (db will contain Microsoft certs)"
 Write-Host ""
-Write-Host "  [GUEST] .\04-Deploy-SiPolicy.ps1 -PKIPath C:\CKS-PKI -EnableCKSExe C:\CKS\EnableCKS.exe"
+Write-Host "  [GUEST] .\04-Deploy-SiPolicy.ps1"
 Write-Host "          Reboot when prompted"
 Write-Host ""
-Write-Host "  [GUEST] .\05-Install-CKS-Driver.ps1 -PKIPath C:\CKS-PKI -CKSDriverPath C:\CKS\ckspdrv.sys"
-Write-Host ""
+Write-Host "  [GUEST] .\05-Install-CKS-Driver.ps1  (within ~10 min of reboot)"
