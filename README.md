@@ -1,5 +1,10 @@
-# Windows10 - Custom Kernel Signers
+# Windwos 11 - Custom Kernel Signers 
 
+June -2026 - Custom tooling and script to enable teams to setup Hyper-V based images with Custom Signed Drivers for Deception based system, Kernel Research and other shenanigans.
+
+
+# Windows10 - Custom Kernel Signers
+Original Repo - Cloned - `https://github.com/HyperSine/Windows10-CustomKernelSigners`
 [中文版README](README.zh-CN.md)
 
 ## 1. What is Custom Kernel Signers?
